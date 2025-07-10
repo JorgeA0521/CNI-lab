@@ -1,0 +1,825 @@
+#!/usr/bin/env python3
+"""
+Multi-Channel Cancer Detection with Pre-computed Analysis Maps
+GPU-accelerated version using CuPy and ThunderSVM for faster processing
+Processes 3-channel images along with pre-computed maps (MFP, phase, etc.)
+Generates comprehensive visualizations including ROC-AUC, PR curves, UMAP, t-SNE
+"""
+
+import numpy as np
+import pandas as pd
+from pathlib import Path
+import warnings
+import tifffile
+from sklearn.model_selection import train_test_split, GridSearchCV, learning_curve, StratifiedKFold
+from sklearn.preprocessing import StandardScaler
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.metrics import (
+    roc_curve, auc, precision_recall_curve, average_precision_score,
+    confusion_matrix, accuracy_score, precision_score, recall_score,
+    f1_score, matthews_corrcoef, roc_auc_score
+)
+from sklearn.manifold import TSNE
+from umap import UMAP
+import matplotlib.pyplot as plt
+import seaborn as sns
+from datetime import datetime
+import json
+import joblib
+from tqdm import tqdm
+import os
+import time
+
+# Try to import GPU libraries
+try:
+    import cupy as cp
+    GPU_AVAILABLE = True
+    print("GPU acceleration available via CuPy")
+    # Print GPU info
+    try:
+        device = cp.cuda.Device()
+        props = cp.cuda.runtime.getDeviceProperties(device.id)
+        print(f"GPU Device: {props['name'].decode()} (ID: {device.id})")
+        free_mem, total_mem = cp.cuda.runtime.memGetInfo()
+        print(f"GPU Memory: {free_mem/1e9:.2f} GB free / {total_mem/1e9:.2f} GB total")
+    except Exception as e:
+        print(f"GPU detected but info unavailable: {e}")
+except ImportError:
+    print("CuPy not found. Install with: pip install cupy-cuda11x")
+    GPU_AVAILABLE = False
+
+warnings.filterwarnings('ignore')
+
+class MultiChannelCancerDetector:
+    def __init__(self, cancerous_folder, benign_folder, output_dir,
+                 maps_base_folder=None, map_types=None, use_gpu=None):
+        """
+        Initialize detector with paths to images and pre-computed maps.
+       
+        Args:
+            cancerous_folder: Path to cancerous images
+            benign_folder: Path to benign images
+            output_dir: Output directory for results
+            maps_base_folder: Base folder containing r_ch1 and g_ch1 subfolders with maps
+            map_types: List of map types to use (e.g., ['mfp', 'phase', 'dry_mass'])
+            use_gpu: Whether to use GPU acceleration (None=auto, True=force, False=disable)
+        """
+        self.cancerous_folder = Path(cancerous_folder)
+        self.benign_folder = Path(benign_folder)
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+       
+        self.maps_base_folder = Path(maps_base_folder) if maps_base_folder else None
+        self.map_types = map_types or ['mfp', 'phase', 'dry_mass', 'anisotropy', 'disorder']
+       
+        # GPU settings
+        if use_gpu is None:
+            self.use_gpu = GPU_AVAILABLE
+        else:
+            self.use_gpu = use_gpu and GPU_AVAILABLE
+       
+        # Map folder structure
+        if self.maps_base_folder:
+            self.cancerous_maps_folder = self.maps_base_folder / 'r_ch1'
+            self.benign_maps_folder = self.maps_base_folder / 'g_ch1'
+        else:
+            self.cancerous_maps_folder = None
+            self.benign_maps_folder = None
+       
+        self.features_df = None
+        self.model = None
+        self.scaler = None
+        self.selected_features = None
+       
+        print(f"Output directory: {self.output_dir}")
+        print(f"GPU acceleration: {'ENABLED' if self.use_gpu else 'DISABLED'}")
+        print(f"Map types to process: {self.map_types}")
+        if self.maps_base_folder:
+            print(f"Maps base folder: {self.maps_base_folder}")
+            print(f"  Cancerous maps: {self.cancerous_maps_folder}")
+            print(f"  Benign maps: {self.benign_maps_folder}")
+       
+    def extract_channel_features(self, img, channel_idx):
+        """Extract features from a single channel with optional GPU acceleration."""
+        channel = img[:, :, channel_idx]
+       
+        if self.use_gpu:
+            # Transfer to GPU
+            channel_gpu = cp.asarray(channel, dtype=cp.float32)
+           
+            features = {}
+           
+            # Basic statistics (GPU)
+            features[f'ch{channel_idx}_mean'] = float(cp.mean(channel_gpu))
+            features[f'ch{channel_idx}_std'] = float(cp.std(channel_gpu))
+            features[f'ch{channel_idx}_median'] = float(cp.median(channel_gpu))
+            features[f'ch{channel_idx}_skew'] = float(self.calculate_skewness_gpu(channel_gpu))
+            features[f'ch{channel_idx}_kurtosis'] = float(self.calculate_kurtosis_gpu(channel_gpu))
+           
+            # Percentiles (GPU)
+            for p in [5, 25, 75, 95]:
+                features[f'ch{channel_idx}_p{p}'] = float(cp.percentile(channel_gpu, p))
+           
+            # Texture features (GPU)
+            features.update(self.extract_texture_features_gpu(channel_gpu, f'ch{channel_idx}'))
+           
+            # Clear GPU memory
+            del channel_gpu
+            cp.get_default_memory_pool().free_all_blocks()
+           
+        else:
+            features = {}
+           
+            # Basic statistics (CPU)
+            features[f'ch{channel_idx}_mean'] = np.mean(channel)
+            features[f'ch{channel_idx}_std'] = np.std(channel)
+            features[f'ch{channel_idx}_median'] = np.median(channel)
+            features[f'ch{channel_idx}_skew'] = self.calculate_skewness(channel)
+            features[f'ch{channel_idx}_kurtosis'] = self.calculate_kurtosis(channel)
+           
+            # Percentiles
+            for p in [5, 25, 75, 95]:
+                features[f'ch{channel_idx}_p{p}'] = np.percentile(channel, p)
+           
+            # Texture features
+            features.update(self.extract_texture_features(channel, f'ch{channel_idx}'))
+       
+        return features
+       
+    def extract_color_relationships(self, img):
+        """Extract inter-channel relationships with optional GPU acceleration."""
+        features = {}
+       
+        if self.use_gpu:
+            # Transfer to GPU
+            img_gpu = cp.asarray(img, dtype=cp.float32)
+           
+            # Channel correlations (GPU)
+            for i in range(3):
+                for j in range(i+1, 3):
+                    ch_i = img_gpu[:,:,i].ravel()
+                    ch_j = img_gpu[:,:,j].ravel()
+                    corr = float(cp.corrcoef(ch_i, ch_j)[0,1])
+                    features[f'corr_ch{i}_ch{j}'] = corr
+           
+            # Channel ratios (GPU)
+            epsilon = 1e-10
+            for i in range(3):
+                for j in range(3):
+                    if i != j:
+                        ratio = float(cp.mean(img_gpu[:,:,i] / (img_gpu[:,:,j] + epsilon)))
+                        features[f'ratio_ch{i}_ch{j}'] = ratio
+           
+            # Color space transforms (GPU)
+            max_rgb = cp.max(img_gpu, axis=2)
+            min_rgb = cp.min(img_gpu, axis=2)
+           
+            # Value (brightness)
+            features['color_value_mean'] = float(cp.mean(max_rgb))
+            features['color_value_std'] = float(cp.std(max_rgb))
+           
+            # Saturation
+            saturation = cp.where(max_rgb > 0, (max_rgb - min_rgb) / (max_rgb + epsilon), 0)
+            features['color_saturation_mean'] = float(cp.mean(saturation))
+            features['color_saturation_std'] = float(cp.std(saturation))
+           
+            # Clear GPU memory
+            del img_gpu, max_rgb, min_rgb, saturation
+            cp.get_default_memory_pool().free_all_blocks()
+           
+        else:
+            # CPU version (original)
+            # Channel correlations
+            for i in range(3):
+                for j in range(i+1, 3):
+                    corr = np.corrcoef(img[:,:,i].ravel(), img[:,:,j].ravel())[0,1]
+                    features[f'corr_ch{i}_ch{j}'] = corr
+           
+            # Channel ratios
+            epsilon = 1e-10
+            for i in range(3):
+                for j in range(3):
+                    if i != j:
+                        ratio = np.mean(img[:,:,i] / (img[:,:,j] + epsilon))
+                        features[f'ratio_ch{i}_ch{j}'] = ratio
+           
+            # Color space transforms
+            max_rgb = np.max(img, axis=2)
+            min_rgb = np.min(img, axis=2)
+           
+            # Value (brightness)
+            features['color_value_mean'] = np.mean(max_rgb)
+            features['color_value_std'] = np.std(max_rgb)
+           
+            # Saturation
+            saturation = np.where(max_rgb > 0, (max_rgb - min_rgb) / (max_rgb + epsilon), 0)
+            features['color_saturation_mean'] = np.mean(saturation)
+            features['color_saturation_std'] = np.std(saturation)
+       
+        return features
+       
+    def extract_texture_features(self, channel, prefix):
+        """Extract texture features from a channel."""
+        features = {}
+       
+        # Gradient features
+        gy, gx = np.gradient(channel)
+        gradient_mag = np.sqrt(gx**2 + gy**2)
+       
+        features[f'{prefix}_gradient_mean'] = np.mean(gradient_mag)
+        features[f'{prefix}_gradient_std'] = np.std(gradient_mag)
+        features[f'{prefix}_gradient_max'] = np.max(gradient_mag)
+       
+        # Local variation
+        window_size = 5
+        local_std = self.calculate_local_std(channel, window_size)
+        features[f'{prefix}_local_variation'] = np.mean(local_std)
+       
+        return features
+       
+    def load_analysis_map(self, base_filename, map_type, is_cancerous):
+        """Load a pre-computed analysis map from the appropriate folder."""
+        if not self.maps_base_folder:
+            return None
+       
+        # Determine which folder to look in
+        maps_folder = self.cancerous_maps_folder if is_cancerous else self.benign_maps_folder
+        map_type_folder = maps_folder / map_type
+       
+        if not map_type_folder.exists():
+            print(f"Warning: Map folder does not exist: {map_type_folder}")
+            return None
+       
+        # Try to find the map file
+        # Pattern: map_type_basefilename.tif
+        map_filename = f"{map_type}_{base_filename}.tif"
+        map_path = map_type_folder / map_filename
+       
+        # Also try .tiff extension
+        if not map_path.exists():
+            map_filename = f"{map_type}_{base_filename}.tiff"
+            map_path = map_type_folder / map_filename
+       
+        if map_path.exists():
+            try:
+                return tifffile.imread(str(map_path))
+            except Exception as e:
+                print(f"Error loading map {map_path}: {e}")
+                return None
+        else:
+            # Try to find any file that contains the base filename
+            matching_files = list(map_type_folder.glob(f"*{base_filename}*"))
+            if matching_files:
+                try:
+                    return tifffile.imread(str(matching_files[0]))
+                except Exception as e:
+                    print(f"Error loading map {matching_files[0]}: {e}")
+                    return None
+            else:
+                print(f"Warning: Could not find {map_type} map for {base_filename} in {map_type_folder}")
+                return None
+       
+    def extract_map_features(self, map_data, map_type):
+        """Extract features from analysis maps."""
+        if map_data is None:
+            return {}
+       
+        features = {}
+       
+        # Handle multi-channel maps
+        if map_data.ndim == 3:
+            # Process each channel separately
+            for ch in range(map_data.shape[2]):
+                channel_data = map_data[:, :, ch]
+                prefix = f'{map_type}_ch{ch}'
+               
+                features[f'{prefix}_mean'] = np.mean(channel_data)
+                features[f'{prefix}_std'] = np.std(channel_data)
+                features[f'{prefix}_median'] = np.median(channel_data)
+                features[f'{prefix}_p95'] = np.percentile(channel_data, 95)
+                features[f'{prefix}_range'] = np.ptp(channel_data)
+               
+        else:
+            # Single channel map
+            features[f'{map_type}_mean'] = np.mean(map_data)
+            features[f'{map_type}_std'] = np.std(map_data)
+            features[f'{map_type}_median'] = np.median(map_data)
+            features[f'{map_type}_p95'] = np.percentile(map_data, 95)
+            features[f'{map_type}_range'] = np.ptp(map_data)
+       
+        return features
+       
+    def process_image(self, image_path, label):
+        """Process a single image and its associated maps."""
+        # Load the main image
+        img = tifffile.imread(str(image_path))
+       
+        # Handle different formats
+        if img.ndim == 2:
+            img = np.stack([img, img, img], axis=-1)
+        elif img.shape[0] == 3 and img.shape[1] != 3:
+            img = np.transpose(img, (1, 2, 0))
+       
+        # Normalize to 0-1
+        img = img.astype(np.float32)
+        if img.max() > 1:
+            img = img / img.max()
+       
+        features = {'filename': image_path.name, 'label': label}
+       
+        # Extract features from each channel
+        for ch_idx in range(3):
+            features.update(self.extract_channel_features(img, ch_idx))
+       
+        # Extract color relationships
+        features.update(self.extract_color_relationships(img))
+       
+        # Extract features from pre-computed maps
+        base_filename = image_path.stem
+        is_cancerous = (label == 1)
+       
+        for map_type in self.map_types:
+            map_data = self.load_analysis_map(base_filename, map_type, is_cancerous)
+            features.update(self.extract_map_features(map_data, map_type))
+       
+        return features
+       
+    def load_and_extract_features(self):
+        """Load all images and extract features."""
+        print("\nExtracting features from images and maps...")
+       
+        # Get image paths
+        cancerous_paths = list(self.cancerous_folder.glob('*.tif'))
+        benign_paths = list(self.benign_folder.glob('*.tif'))
+       
+        print(f"Found {len(cancerous_paths)} cancerous and {len(benign_paths)} benign images")
+       
+        all_features = []
+       
+        # Process cancerous images
+        for path in tqdm(cancerous_paths, desc="Processing cancerous images"):
+            try:
+                features = self.process_image(path, 1)
+                all_features.append(features)
+            except Exception as e:
+                print(f"Error processing {path.name}: {e}")
+       
+        # Process benign images
+        for path in tqdm(benign_paths, desc="Processing benign images"):
+            try:
+                features = self.process_image(path, 0)
+                all_features.append(features)
+            except Exception as e:
+                print(f"Error processing {path.name}: {e}")
+       
+        self.features_df = pd.DataFrame(all_features)
+        print(f"\nFeature extraction complete. Shape: {self.features_df.shape}")
+       
+        # Save features
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        features_path = self.output_dir / f'features_{timestamp}.csv'
+        self.features_df.to_csv(features_path, index=False)
+        print(f"Features saved to: {features_path}")
+       
+        return self.features_df
+       
+    def train_svm(self):
+        """Train SVM with feature selection and grid search, with GPU acceleration if available."""
+        print("\nTraining SVM model...")
+       
+        # Prepare data
+        feature_cols = [col for col in self.features_df.columns if col not in ['label', 'filename']]
+        X = self.features_df[feature_cols].fillna(0)
+        y = self.features_df['label']
+       
+        # Split data
+        self.X_train, self.X_test, self.y_train, self.y_test = train_test_split(
+            X, y, test_size=0.2, random_state=42, stratify=y
+        )
+       
+        # Store full data for visualization
+        self.X_full = X
+        self.y_full = y
+       
+        # Feature selection
+        print("Performing feature selection...")
+        # SelectKBest is a CPU-based function and works directly with NumPy arrays (X_train.values, y_train.values)
+        # Therefore, no separate GPU path is needed or available for this specific step.
+        selector = SelectKBest(f_classif, k=min(50, len(feature_cols)))
+        selector.fit(self.X_train, self.y_train)
+        feature_mask = selector.get_support()
+        self.selected_features = [feat for feat, selected in zip(feature_cols, feature_mask) if selected]
+       
+        print(f"Selected {len(self.selected_features)} features")
+       
+        # Filter features
+        X_train_selected = self.X_train[self.selected_features]
+        X_test_selected = self.X_test[self.selected_features]
+       
+        # Scale data
+        self.scaler = StandardScaler()
+        X_train_scaled = self.scaler.fit_transform(X_train_selected)
+        X_test_scaled = self.scaler.transform(X_test_selected)
+       
+   
+   
+        # CPU version with sklearn
+        print("\nUsing sklearn SVM (CPU)...")
+       
+        # Ensure SVC is imported if ThunderSVM is not available
+        if not THUNDERSVM_AVAILABLE:
+            from sklearn.svm import SVC
+       
+        param_grid = {
+            'C': [0.1, 1, 10, 100],
+            'gamma': ['scale', 'auto', 0.001, 0.01],
+            'kernel': ['rbf', 'linear']
+        }
+       
+        self.model = SVC(probability=True, random_state=42)
+       
+        grid_search = GridSearchCV(
+            self.model,
+            param_grid,
+            cv=10,
+            scoring='roc_auc',
+            n_jobs=-1,
+            verbose=1
+        )
+       
+        grid_search.fit(X_train_scaled, self.y_train)
+       
+        self.model = grid_search.best_estimator_
+        print(f"\nBest parameters: {grid_search.best_params_}")
+        print(f"Best CV ROC-AUC: {grid_search.best_score_:.3f}")
+       
+        # Evaluate on test set
+        print("\nEvaluating on test set...")
+        self.y_pred = self.model.predict(X_test_scaled)
+        self.y_pred_proba = self.model.predict_proba(X_test_scaled)
+       
+        if self.y_pred_proba.shape[1] == 2:
+            self.y_pred_proba = self.y_pred_proba[:, 1]
+       
+        # Calculate test metrics
+        test_accuracy = accuracy_score(self.y_test, self.y_pred)
+        test_roc_auc = roc_auc_score(self.y_test, self.y_pred_proba)
+        print(f"Test Accuracy: {test_accuracy:.3f}")
+        print(f"Test ROC-AUC: {test_roc_auc:.3f}")
+       
+        # Save model and preprocessing info
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        model_info = {
+            'model': self.model,
+            'scaler': self.scaler,
+            'selected_features': self.selected_features,
+            'feature_columns': feature_cols,
+            'use_gpu': self.use_gpu and THUNDERSVM_AVAILABLE
+        }
+       
+        model_path = self.output_dir / f'svm_model_{timestamp}.pkl'
+        joblib.dump(model_info, model_path)
+        print(f"Model saved to: {model_path}")
+       
+       
+        return self.model
+
+    def plot_all_visualizations(self):
+        """Generate all requested visualizations as a 3x3 subplot grid in a single output figure."""
+        print("\nGenerating visualizations as a combined subplot figure...")
+       
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+       
+        # Create a single figure with a 3x3 subplot grid
+        # Adjusted figsize for the overall figure to make subplots appear more square/balanced
+        fig = plt.figure(figsize=(15, 15)) # Sizing changed here, from (22,18) to (18,18)
+       
+        # 1. ROC-AUC Curve
+        ax1 = plt.subplot(3, 3, 1)
+        fpr, tpr, _ = roc_curve(self.y_test, self.y_pred_proba)
+        roc_auc = auc(fpr, tpr)
+        ax1.plot(fpr, tpr, 'b-', lw=2, label=f'ROC curve (AUC = {roc_auc:.3f})')
+        ax1.plot([0, 1], [0, 1], 'k--', lw=1)
+        ax1.set_xlabel('False Positive Rate')
+        ax1.set_ylabel('True Positive Rate')
+        ax1.set_title('ROC Curve')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+
+        # 2. Precision-Recall Curve
+        ax2 = plt.subplot(3, 3, 2)
+        precision_pr_curve, recall_pr_curve, _ = precision_recall_curve(self.y_test, self.y_pred_proba)
+        ap = average_precision_score(self.y_test, self.y_pred_proba)
+        ax2.plot(recall_pr_curve, precision_pr_curve, 'g-', lw=2, label=f'PR curve (AP = {ap:.3f})')
+        ax2.set_xlabel('Recall')
+        ax2.set_ylabel('Precision')
+        ax2.set_title('Precision-Recall Curve')
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+       
+        # 3. Precision, Recall, and F1 Score vs Threshold (combined plot)
+        ax3 = plt.subplot(3, 3, 3)
+        thresholds = np.linspace(0, 1, 100)
+        precision_scores = []
+        recall_scores = []
+        f1_scores = []
+
+        for threshold in thresholds:
+            y_pred_threshold = (self.y_pred_proba >= threshold).astype(int)
+            if len(np.unique(y_pred_threshold)) > 1:
+                prec = precision_score(self.y_test, y_pred_threshold, zero_division=0)
+                rec = recall_score(self.y_test, y_pred_threshold, zero_division=0)
+                f1 = f1_score(self.y_test, y_pred_threshold, zero_division=0)
+            else:
+                prec, rec, f1 = 0, 0, 0
+
+            precision_scores.append(prec)
+            recall_scores.append(rec)
+            f1_scores.append(f1)
+       
+        ax3.plot(thresholds, precision_scores, 'b-', lw=2, label='Precision')
+        ax3.plot(thresholds, recall_scores, 'g-', lw=2, label='Recall')
+        ax3.plot(thresholds, f1_scores, 'r-', lw=2, label='F1-Score')
+
+        optimal_idx = np.argmax(f1_scores)
+        optimal_threshold = thresholds[optimal_idx]
+        optimal_f1 = f1_scores[optimal_idx]
+       
+        ax3.scatter(optimal_threshold, optimal_f1, color='darkred', s=100, zorder=5, label=f'Optimal F1 ({optimal_f1:.3f} at {optimal_threshold:.3f})')
+        ax3.axvline(x=0.5, color='k', linestyle='--', alpha=0.5, label='Default Threshold (0.5)')
+       
+        ax3.set_xlabel('Threshold')
+        ax3.set_ylabel('Score')
+        ax3.set_title('P, R, F1 Score vs Threshold')
+        ax3.legend()
+        ax3.grid(True, alpha=0.3)
+
+        # 4. Learning Curves
+        ax4 = plt.subplot(3, 3, 4)
+        train_sizes, train_scores, val_scores = learning_curve(
+            self.model, self.X_train, self.y_train, cv=5,
+            train_sizes=np.linspace(0.1, 1.0, 10), scoring='roc_auc', n_jobs=-1
+        )
+       
+        train_mean = np.mean(train_scores, axis=1)
+        train_std = np.std(train_scores, axis=1)
+        val_mean = np.mean(val_scores, axis=1)
+        val_std = np.std(val_scores, axis=1)
+       
+        ax4.plot(train_sizes, train_mean, 'b-', label='Training')
+        ax4.fill_between(train_sizes, train_mean - train_std, train_mean + train_std, alpha=0.1)
+        ax4.plot(train_sizes, val_mean, 'r-', label='Validation')
+        ax4.fill_between(train_sizes, val_mean - val_std, val_mean + val_std, alpha=0.1)
+        ax4.set_xlabel('Training Set Size')
+        ax4.set_ylabel('ROC-AUC Score')
+        ax4.set_title('4. Learning Curves')
+        ax4.legend()
+        ax4.grid(True, alpha=0.3)
+
+        # 5. Normalized Confusion Matrix
+        ax5 = plt.subplot(3, 3, 5)
+        cm = confusion_matrix(self.y_test, self.y_pred)
+        cm_normalized = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+       
+        sns.heatmap(cm_normalized, annot=True, fmt='.2%', cmap='Blues', ax=ax5,
+                    xticklabels=['Benign', 'Cancer'],
+                    yticklabels=['Benign', 'Cancer'], cbar=False)
+        ax5.set_title('Normalized Confusion Matrix')
+        ax5.set_xlabel('Predicted')
+        ax5.set_ylabel('Actual')
+       
+        # 6. Feature Importance (Top 20)
+        ax6 = plt.subplot(3, 3, 6)
+        temp_selector = SelectKBest(f_classif, k=len(self.X_full.columns))
+        temp_selector.fit(self.X_full, self.y_full)
+       
+        if hasattr(temp_selector, 'scores_'):
+            feature_scores = pd.DataFrame({
+                'feature': [col for col in self.X_full.columns if col not in ['label', 'filename']],
+                'score': temp_selector.scores_
+            }).sort_values('score', ascending=False).head(20)
+           
+            ax6.barh(range(len(feature_scores)), feature_scores['score'])
+            ax6.set_yticks(range(len(feature_scores)))
+            ax6.set_yticklabels(feature_scores['feature'], fontsize=8)
+            ax6.set_xlabel('F-Score')
+            ax6.set_title('Top 20 Features')
+            ax6.invert_yaxis()
+            ax6.grid(True, alpha=0.3, axis='x')
+        else:
+            ax6.text(0.5, 0.5, "Feature scores not available.",
+                     horizontalalignment='center', verticalalignment='center', transform=ax6.transAxes)
+            ax6.axis('off')
+       
+        # Prepare data for UMAP and t-SNE
+        X_scaled = self.scaler.transform(self.X_full[self.selected_features])
+        colors = ['#3498db', '#e74c3c']
+
+        # 7. UMAP
+        ax7 = plt.subplot(3, 3, 7)
+        print("Computing UMAP...")
+        umap = UMAP(n_components=2, random_state=42, n_neighbors=15, min_dist=0.1)
+        X_umap = umap.fit_transform(X_scaled)
+       
+        for label, color in zip([0, 1], colors):
+            mask = self.y_full == label
+            label_name = 'Benign' if label == 0 else 'Cancer'
+            ax7.scatter(X_umap[mask, 0], X_umap[mask, 1],
+                        c=color, label=label_name, alpha=0.6, s=30, edgecolors='k', linewidth=0.5)
+        ax7.set_xlabel('UMAP 1')
+        ax7.set_ylabel('UMAP 2')
+        ax7.set_title('UMAP Projection')
+        ax7.legend()
+        ax7.grid(True, alpha=0.3)
+
+        # 8. t-SNE
+        ax8 = plt.subplot(3, 3, 8)
+        print("Computing t-SNE...")
+        tsne = TSNE(n_components=2, random_state=42, perplexity=30, max_iter=1000)
+        X_tsne = tsne.fit_transform(X_scaled)
+       
+        for label, color in zip([0, 1], colors):
+            mask = self.y_full == label
+            label_name = 'Benign' if label == 0 else 'Cancer'
+            ax8.scatter(X_tsne[mask, 0], X_tsne[mask, 1],
+                        c=color, label=label_name, alpha=0.6, s=30, edgecolors='k', linewidth=0.5)
+        ax8.set_xlabel('t-SNE 1')
+        ax8.set_ylabel('t-SNE 2')
+        ax8.set_title('t-SNE Projection')
+        ax8.legend()
+        ax8.grid(True, alpha=0.3)
+       
+        # 9. Metrics Summary
+        ax9 = plt.subplot(3, 3, 9)
+        ax9.axis('off')
+       
+        metrics = {
+            'Accuracy': accuracy_score(self.y_test, self.y_pred),
+            'ROC-AUC': roc_auc_score(self.y_test, self.y_pred_proba),
+            'Precision': precision_score(self.y_test, self.y_pred, zero_division=0),
+            'Recall': recall_score(self.y_test, self.y_pred, zero_division=0),
+            'F1-Score': f1_score(self.y_test, self.y_pred, zero_division=0),
+            'MCC': matthews_corrcoef(self.y_test, self.y_pred)
+        }
+       
+        metrics_text = "Performance Metrics\n" + "-"*25 + "\n"
+        for metric, value in metrics.items():
+            metrics_text += f"{metric}: {value:.3f}\n"
+       
+        ax9.text(0.05, 0.95, metrics_text, transform=ax9.transAxes,
+                 fontsize=12, verticalalignment='top',
+                 bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.5))
+        ax9.set_title('Metrics Summary')
+
+        plt.suptitle('Multi-Channel Cancer Detection Results', fontsize=20, fontweight='bold', y=1.02)
+        plt.tight_layout(rect=[0, 0.03, 1, 0.98])
+       
+        # Save the entire combined subplot figure
+        combined_plot_path = self.output_dir / f'combined_results_visualization_{timestamp}.png'
+        plt.savefig(combined_plot_path, dpi=300, bbox_inches='tight')
+        plt.show()
+       
+        print(f"Combined visualizations saved to: {combined_plot_path}")
+       
+        # Save results to JSON (same as before)
+        results = {
+            'metrics': metrics,
+            'best_params': self.model.get_params(),
+            'selected_features': self.selected_features,
+            'optimal_threshold': float(optimal_threshold),
+            'optimal_f1': float(optimal_f1)
+        }
+       
+        results_path = self.output_dir / f'results_{timestamp}.json'
+        with open(results_path, 'w') as f:
+            json.dump(results, f, indent=2)
+       
+        print(f"Results data saved to: {results_path}")
+
+    def calculate_kurtosis_gpu(self, data):
+        """Calculate kurtosis using GPU."""
+        mean = cp.mean(data)
+        std = cp.std(data)
+        if std == 0:
+            return 0
+        return float(cp.mean(((data - mean) / std) ** 4) - 3)
+       
+    def extract_texture_features_gpu(self, channel, prefix):
+        """Extract texture features using GPU."""
+        features = {}
+       
+        # Gradient features (GPU)
+        gy = cp.gradient(channel, axis=0)
+        gx = cp.gradient(channel, axis=1)
+        gradient_mag = cp.sqrt(gx**2 + gy**2)
+       
+        features[f'{prefix}_gradient_mean'] = float(cp.mean(gradient_mag))
+        features[f'{prefix}_gradient_std'] = float(cp.std(gradient_mag))
+        features[f'{prefix}_gradient_max'] = float(cp.max(gradient_mag))
+       
+        # Local variation (GPU)
+        from cupyx.scipy.ndimage import uniform_filter as cp_uniform_filter
+        local_mean = cp_uniform_filter(channel, window_size=5)
+        local_sq_mean = cp_uniform_filter(channel**2, window_size=5)
+        local_variance = local_sq_mean - local_mean**2
+        local_std = cp.sqrt(cp.maximum(local_variance, 0))
+        features[f'{prefix}_local_variation'] = float(cp.mean(local_std))
+       
+        return features
+       
+    # CPU helper methods
+    def calculate_skewness(self, data):
+        """Calculate skewness of data."""
+        mean = np.mean(data)
+        std = np.std(data)
+        if std == 0:
+            return 0
+        return np.mean(((data - mean) / std) ** 3)
+       
+    def calculate_kurtosis(self, data):
+        """Calculate kurtosis of data."""
+        mean = np.mean(data)
+        std = np.std(data)
+        if std == 0:
+            return 0
+        return np.mean(((data - mean) / std) ** 4) - 3
+       
+    def calculate_local_std(self, image, window_size):
+        """Calculate local standard deviation."""
+        from scipy.ndimage import uniform_filter
+        mean = uniform_filter(image, window_size)
+        sqr_mean = uniform_filter(image**2, window_size)
+        variance = sqr_mean - mean**2
+        return np.sqrt(np.maximum(variance, 0))
+
+
+# Main execution
+if __name__ == "__main__":
+    # --- Configuration for Running ---
+    # Define paths for input images and where *new* outputs will be saved
+    cancerous_folder = r"C:\Users\BI2053\Desktop\breast_cancer_slides_data_2025\ch1_r"
+    benign_folder = r"C:\Users\BI2053\Desktop\breast_cancer_slides_data_2025\ch1_g"
+    output_dir = r"C:\Users\BI2053\Desktop\breast_cancer_slides_data_2025\multichannel_analysis"
+   
+    # Base folder containing the pre-computed maps (r_ch1 and g_ch1 subfolders)
+    maps_base_folder = r"C:\Users\BI2053\Desktop\breast_cancer_slides_data_2025"
+   
+    # *** RESUME TRAINING FROM PRE-EXTRACTED FEATURES ***
+    # Set this to the full path of a features CSV file if you want to skip feature extraction
+    # and directly proceed to SVM training and visualization.
+    # Set to None to perform feature extraction from scratch.
+    PRE_EXTRACTED_FEATURES_CSV_PATH = r"C:\Users\BI2053\Desktop\breast_cancer_slides_data_2025\multichannel_analysis\features_20250628_121810.csv"
+    # PRE_EXTRACTED_FEATURES_CSV_PATH = None # Uncomment this line to run feature extraction from scratch
+
+    # Initialize detector with GPU acceleration
+    detector = MultiChannelCancerDetector(
+        cancerous_folder=cancerous_folder,
+        benign_folder=benign_folder,
+        output_dir=output_dir,
+        maps_base_folder=maps_base_folder,
+        map_types=['mfp', 'phase', 'dry_mass', 'anisotropy', 'disorder'],
+        use_gpu=True  # Enable GPU acceleration
+    )
+   
+    print("="*60)
+    print("Multi-Channel Cancer Detection with Pre-computed Maps")
+    if detector.use_gpu and THUNDERSVM_AVAILABLE:
+        print("Using GPU acceleration for both feature extraction and SVM training")
+    elif detector.use_gpu:
+        print("Using GPU acceleration for feature extraction only (ThunderSVM not available)")
+    else:
+        print("Running in CPU mode")
+    print("="*60)
+   
+    # Extract features or load pre-extracted features
+    if PRE_EXTRACTED_FEATURES_CSV_PATH:
+        print(f"\nLoading pre-extracted features from: {PRE_EXTRACTED_FEATURES_CSV_PATH}")
+        try:
+            detector.features_df = pd.read_csv(PRE_EXTRACTED_FEATURES_CSV_PATH)
+            print(f"Features loaded. Shape: {detector.features_df.shape}")
+        except FileNotFoundError:
+            print(f"Error: Features CSV not found at {PRE_EXTRACTED_FEATURES_CSV_PATH}. Exiting.")
+            exit()
+        except Exception as e:
+            print(f"Error loading features CSV: {e}. Exiting.")
+            exit()
+    else:
+        # This will call the load_and_extract_features method and populate detector.features_df
+        detector.load_and_extract_features()
+   
+    # Train SVM
+    model = detector.train_svm()
+   
+    # Generate all visualizations
+    detector.plot_all_visualizations()
+   
+    print("\n✓ Analysis Complete!")
+   
+    # Print GPU memory usage if available
+    if GPU_AVAILABLE and detector.use_gpu:
+        try:
+            mempool = cp.get_default_memory_pool()
+            print(f"\nGPU Memory Pool: {mempool.used_bytes() / 1e9:.2f} GB used")
+            mempool.free_all_blocks()
+        except:
+            pass
