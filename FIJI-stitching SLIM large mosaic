@@ -1,5 +1,5 @@
 // INSTRUCTIONS TO RUN SCRIPT
-// Steps to run a macro on by selecting imageJ macro on language
+// Steps to run a macro
 // Open FIJI -> Plugins -> Macros -> Edit -> Click on Run button on bottom left corner -> Input fields as required
 // Enter rootFolder in Root directory input (make sure there arent any spaces in directory path or file names)
 // Directory should look like this
@@ -9,7 +9,7 @@
 //		img(1).tif
 //		img(2).tif
 //		...
-run("Monitor Memory...");
+
 #@File(label = "Root directory", style = "directory", description = "Path to directory which has all folders to stitch") image_path
 #@String(label = "Generic file name", description="eg img({i}).tif") image_names
 #@boolean(label = "Process all folders", description="Deselect if you want to choose folders to process in next step") processAll
@@ -17,6 +17,7 @@ run("Monitor Memory...");
 #@String(label = "Grid size x (for all folders)", description="Number of columns, enter comma seperated values for each folder") grid_size_x
 #@String(label = "Grid size y (for all folders)", description="Number of rows, enter comma seperated values for each folder") grid_size_y
 #@String(label = "Tile overlap in %", description="Tile overlap, enter comma seperated values for each folder") tile_overlap
+
 
 
 var extension = ".tif";
@@ -87,9 +88,7 @@ function stitchList(folders, image_names) {
 		run("Grid/Collection stitching", command);
 		
 		run("Jet");
-		//run("Brightness/Contrast...");
-		run("Enhance Contrast", "saturated=0.35");
-				
+
 	}
 
 }
@@ -107,6 +106,3 @@ function showSelectionDialog(folderList) {
 		}
 	}
 }
-
-//run("Brightness/Contrast...");
-setMinAndMax(-0.20, 0.65);
