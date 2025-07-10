@@ -1,0 +1,112 @@
+// INSTRUCTIONS TO RUN SCRIPT
+// Steps to run a macro on by selecting imageJ macro on language
+// Open FIJI -> Plugins -> Macros -> Edit -> Click on Run button on bottom left corner -> Input fields as required
+// Enter rootFolder in Root directory input (make sure there arent any spaces in directory path or file names)
+// Directory should look like this
+// <fakepath>/rootFolder
+//	/folder1
+//		/output
+//		img(1).tif
+//		img(2).tif
+//		...
+run("Monitor Memory...");
+#@File(label = "Root directory", style = "directory", description = "Path to directory which has all folders to stitch") image_path
+#@String(label = "Generic file name", description="eg img({i}).tif") image_names
+#@boolean(label = "Process all folders", description="Deselect if you want to choose folders to process in next step") processAll
+#@boolean(label = "Quick stitching (do not compute overlap)", description="Select if you dont want to compute overlap") doQuick
+#@String(label = "Grid size x (for all folders)", description="Number of columns, enter comma seperated values for each folder") grid_size_x
+#@String(label = "Grid size y (for all folders)", description="Number of rows, enter comma seperated values for each folder") grid_size_y
+#@String(label = "Tile overlap in %", description="Tile overlap, enter comma seperated values for each folder") tile_overlap
+
+
+var extension = ".tif";
+var folderList = newArray();
+var selectedFiles = newArray();
+var selectedFolders = newArray();
+var grid_size_x = mapToInt(split(grid_size_x, ","));
+var grid_size_y = mapToInt(split(grid_size_y, ","));
+var tile_overlap = mapToInt(split(tile_overlap, ","));
+var image_names = split(image_names, ",")
+
+
+setBatchMode(true);
+main();
+setBatchMode(false);
+
+function mapToInt(input){
+	for (i=0; i<input.length; i++){
+		input[i] = parseInt(input[i]);
+	}
+	return input;
+
+}
+
+function parseFolder(input) {
+    list = getFileList(input);
+    Array.sort(list);
+    for (i = 0; i < list.length; i++) {
+        folderList = Array.concat(folderList, input+File.separator+list[i]);
+
+    }
+}
+
+
+function main() {
+	parseFolder(image_path);
+	if (processAll) {
+		stitchList(folderList, image_names);
+	} 
+	else {
+		print(image_names[0]);
+		showSelectionDialog(folderList);
+		stitchList(selectedFolders, image_names);
+	}
+}
+
+function stitchList(folders, image_names) {
+
+	for (i=0; i<folders.length; i++){
+		var command = "type=[Filename defined position] order=[Defined by filename         ]" +
+				" grid_size_x=" + grid_size_x[i] +
+				" grid_size_y=" + grid_size_y[i] +
+				" tile_overlap=" + tile_overlap[i] +
+				" first_file_index_x=0"+
+				" first_file_index_y=0"+
+				" directory=" + folders[i] +
+				" file_names=" + image_names[i] +
+				" output_textfile_name=TileConfiguration.txt"+
+				" fusion_method=[Linear Blending]"+
+				" regression_threshold=0.30"+
+				" max/avg_displacement_threshold=2.50"+
+				" absolute_displacement_threshold=3.50"+
+				" computation_parameters=[Save memory (but be slower)]"+
+				" image_output=[Fuse and display]";
+			
+		if (!doQuick)
+			command += " compute_overlap";
+		run("Grid/Collection stitching", command);
+		
+		run("Jet");
+		//run("Brightness/Contrast...");
+		run("Enhance Contrast", "saturated=0.35");
+				
+	}
+
+}
+
+function showSelectionDialog(folderList) {
+	Dialog.create("Select folders to process")
+	for (i = 0; i < folderList.length; i++) {
+		Dialog.addCheckbox(folderList[i], false);
+	}
+	Dialog.show();
+	
+	for (i = 0; i < folderList.length; i++) {
+		if (Dialog.getCheckbox()) {
+			selectedFolders = Array.concat(selectedFolders, folderList[i]);
+		}
+	}
+}
+
+//run("Brightness/Contrast...");
+setMinAndMax(-0.20, 0.65);
