@@ -1,0 +1,327 @@
+#!/usr/bin/env python3
+"""
+Full QPI Map & Channel‑Phase Montage Generator
+
+Processes raw benign/cancer TIFFs to compute QPI maps and generate:
+  • Individual 1×5 montages of φ, var, ls, g, disorder for the first sample of each group.
+  • Four‑sample 2×5 montage combining the first two benign and first two cancer.
+  • Channel‑phase montages (φR, φG, φB, φ) at full resolution and 3×3, 25×25, 50×50 crops.
+  • Combined Benign vs Cancer QPI montages (2×5) at full, 3×3, 25×25, 50×50 windows.
+"""
+
+import os
+import sys
+import glob
+import argparse
+from collections import Counter
+
+import numpy as np
+import matplotlib.pyplot as plt
+import tifffile as tiff
+from scipy.ndimage import uniform_filter
+
+# ─── DIRECTORIES ─────────────────────────────────────────────────────────────
+RAW_BENIGN_DIR = '/home/cni/Documents/cancer/Cancercrops/Benign'
+RAW_CANCER_DIR = '/home/cni/Documents/cancer/Cancercrops/cancer'
+CH_BENIGN_DIR  = RAW_BENIGN_DIR
+CH_CANCER_DIR  = RAW_CANCER_DIR
+OUTPUT_DIR     = '/home/cni/Documents/cancer/results'
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ─── QPI MAP FUNCTIONS ─────────────────────────────────────────────────────────
+def load_phase_image(path):
+    return tiff.imread(path).astype(np.float64)
+
+def subtract_background(phi, bg):
+    return phi - bg
+
+def local_variance(phi, w):
+    m  = uniform_filter(phi, size=w)
+    m2 = uniform_filter(phi*phi, size=w)
+    return m2 - m*m
+
+def compute_scattering_mfp(v, A, h, eps):
+    return 1.0 / (v/(A*h) + eps)
+
+def compute_g_map(phi, v, k0, px_nm, eps):
+    gy, gx = np.gradient(phi, px_nm, px_nm)
+    return 1.0 - (1.0/(2*k0**2))*(gx*gx + gy*gy)/(v + eps)
+
+def compute_disorder(phi, w, n_mean, l_c, eps):
+    lm = uniform_filter(phi, size=w)
+    lv = uniform_filter(phi*phi, size=w) - lm*lm
+    return (lv/(lm*lm + eps)) * (n_mean**2 * l_c)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def list_raw_samples(folder):
+    """ Recursively find raw-phase .tif/.tiff in folder (skip channel RGB). """
+    patterns = ['**/*.tif','**/*.tiff','**/*.TIF','**/*.TIFF']
+    all_files = sum((glob.glob(os.path.join(folder, p), recursive=True)
+                     for p in patterns), [])
+    raw = [f for f in all_files
+           if not os.path.splitext(os.path.basename(f))[0].endswith(('R','G','B'))]
+    if not raw:
+        print(f"⚠️  No raw-phase TIFFs found in {folder}. Contents:")
+        for fn in os.listdir(folder):
+            print("   ", fn)
+        sys.exit(1)
+    return sorted(raw)
+
+def process_file(path, out_dir, params, group):
+    sample = os.path.splitext(os.path.basename(path))[0]
+    base   = f"{group}_{sample}"
+    print(f"→ processing {base}")
+    phi    = subtract_background(load_phase_image(path), params['background_phase'])
+    vmap   = local_variance(phi, params['var_window'])
+    ls     = compute_scattering_mfp(vmap,
+                                    params['pixel_area'],
+                                    params['sample_height'],
+                                    params['eps'])
+    rawg   = compute_g_map(phi,
+                           vmap,
+                           params['k0'],
+                           params['pixel_size_nm'],
+                           params['eps'])
+    lo, hi = np.percentile(rawg, (2, 98))
+    # FIXED: use (hi - lo), not (hi - hi), and avoid zero by adding eps
+    gmap   = np.clip((rawg - lo) / (hi - lo + params['eps']), 0, 1)
+    dmap   = compute_disorder(phi,
+                              params['disorder_window'],
+                              params['n_mean'],
+                              params['l_c'],
+                              params['eps'])
+
+    for name, arr in [('orig', phi),
+                      ('var', vmap),
+                      ('ls', ls),
+                      ('g', gmap),
+                      ('disorder', dmap)]:
+        out_path = os.path.join(out_dir, f"{base}_{name}.tif")
+        tiff.imwrite(out_path, arr.astype(np.float32))
+
+# ─── PLOTTING CONSTANTS ─────────────────────────────────────────────────────────
+QPI_FORMULAS = [r'$\phi$',
+                r'$\langle(\phi-\langle\phi\rangle)^2\rangle$',
+                r'$\ell_s$', r'$g$', r'$L_d$']
+QPI_MAPS     = ['orig', 'var', 'ls', 'g', 'disorder']
+CB_LABELS    = ['Phase (rad)', 'Variance (rad²)', 'MFP (µm)',
+                'Anisotropy', 'Disorder (µm)']
+CP_FORMULAS  = [r'$\phi_R$', r'$\phi_G$', r'$\phi_B$', r'$\phi$']
+CP_SUFFIXES  = ['R', 'G', 'B', '']
+CP_LABEL     = 'Phase (rad)'
+# ──────────────────────────────────────────────────────────────────────────────
+
+def plot_individual_qpi(sample, group, params, out_dir):
+    base = f"{group}_{sample}"
+    fig, axes = plt.subplots(1, 5, figsize=(10, 2), constrained_layout=True)
+    for i, m in enumerate(QPI_MAPS):
+        img = tiff.imread(os.path.join(out_dir, f"{base}_{m}.tif"))
+        lo, hi = np.percentile(img, (2, 98))
+        im = axes[i].imshow(img, cmap='jet', vmin=lo, vmax=hi)
+        axes[i].set_title(QPI_FORMULAS[i], fontsize=8)
+        axes[i].axis('off')
+        cb = fig.colorbar(im, ax=axes[i], fraction=0.05, pad=0.01)
+        cb.set_label(CB_LABELS[i], fontsize=7)
+        cb.ax.tick_params(labelsize=6)
+    fig.savefig(os.path.join(out_dir, f"{base}_individual_qpi.png"), dpi=150)
+    plt.close(fig)
+
+def plot_four_sample_qpi(params, out_dir):
+    raw_b = params['raw_benign'][:2]
+    raw_c = params['raw_cancer'][:2]
+    samples = [('benign', raw_b), ('cancer', raw_c)]
+    flat    = [(g, s) for g, lst in samples for s in lst]
+
+    fig, axes = plt.subplots(len(flat), 5,
+                             figsize=(10, len(flat)*2),
+                             constrained_layout=True)
+    vmins = [np.inf]*5
+    vmaxs = [-np.inf]*5
+    for j, m in enumerate(QPI_MAPS):
+        for g, s in flat:
+            arr = tiff.imread(os.path.join(out_dir, f"{g}_{s}_{m}.tif"))
+            lo, hi = np.percentile(arr, (2, 98))
+            vmins[j] = min(vmins[j], lo)
+            vmaxs[j] = max(vmaxs[j], hi)
+
+    for i, (g, s) in enumerate(flat):
+        row = axes[i] if len(flat) > 1 else axes
+        for j, m in enumerate(QPI_MAPS):
+            ax = row[j]
+            arr = tiff.imread(os.path.join(out_dir, f"{g}_{s}_{m}.tif"))
+            im = ax.imshow(arr, cmap='jet',
+                           vmin=vmins[j], vmax=vmaxs[j])
+            if j == 0:
+                ax.set_ylabel(g.capitalize(), fontsize=10)
+            ax.set_title(QPI_FORMULAS[j], fontsize=8)
+            ax.axis('off')
+            cb = fig.colorbar(im, ax=ax, fraction=0.03, pad=0.01)
+            cb.set_label(CB_LABELS[j], fontsize=7)
+            cb.ax.tick_params(labelsize=6)
+    fig.savefig(os.path.join(out_dir, "four_sample_qpi.png"), dpi=200)
+    plt.close(fig)
+
+def plot_channel_montage(group, folder, params, out_dir, window=None):
+    paths = glob.glob(os.path.join(folder, '*.tif')) \
+          + glob.glob(os.path.join(folder, '*.tiff'))
+    names = [os.path.splitext(os.path.basename(p))[0] for p in paths]
+    stripped = [n[:-1] if n[-1] in ('R','G','B') else n for n in names]
+    sample = Counter(stripped).most_common(1)[0][0]
+
+    extremes, imgs = [], []
+    for suf in CP_SUFFIXES:
+        for ext in ('.tif', '.tiff'):
+            fp = os.path.join(folder, f"{sample}{suf}{ext}")
+            if os.path.exists(fp):
+                arr = tiff.imread(fp).astype(np.float32)
+                lo, hi = np.percentile(arr, (2, 98))
+                extremes.append((lo, hi))
+                imgs.append(arr)
+                break
+
+    fig, axes = plt.subplots(1, 4, figsize=(8, 2), constrained_layout=True)
+    for i, arr in enumerate(imgs):
+        sub = arr
+        if window:
+            h, w = arr.shape
+            cy, cx = h//2, w//2
+            r = window//2
+            sub = arr[cy-r:cy-r+window, cx-r:cx-r+window]
+        lo, hi = extremes[i]
+        ax = axes[i]
+        im = ax.imshow(sub, cmap='jet', vmin=lo, vmax=hi)
+        ax.set_title(CP_FORMULAS[i], fontsize=8)
+        ax.axis('off')
+        sb = params['scalebar_um'] / params['pixel_size']
+        h3, w3 = sub.shape
+        x0, y0 = int(0.02*w3), int(0.95*h3)
+        ax.plot([x0, x0+sb], [y0, y0], 'w-', lw=1.5)
+        ax.text(x0, y0-0.05*h3,
+                f"{params['scalebar_um']} µm",
+                fontsize=6, color='white')
+        cb = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.02)
+        cb.set_label(CP_LABEL, fontsize=7)
+        cb.ax.tick_params(labelsize=6)
+    tag = 'full' if window is None else f'win{window}'
+    fig.savefig(os.path.join(out_dir, f'channel_{group}_{tag}.png'), dpi=300)
+    plt.close(fig)
+
+def plot_combined_qpi(params, out_dir, window):
+    raw_b = params['raw_benign'][0]
+    raw_c = params['raw_cancer'][0]
+    groups = [('benign', raw_b), ('cancer', raw_c)]
+
+    vmins = [np.inf]*5
+    vmaxs = [-np.inf]*5
+    data  = [[None]*5 for _ in groups]
+
+    for i, (g, s) in enumerate(groups):
+        for j, m in enumerate(QPI_MAPS):
+            arr = tiff.imread(os.path.join(out_dir, f"{g}_{s}_{m}.tif"))\
+                      .astype(np.float32)
+            if window:
+                h, w = arr.shape
+                cy, cx = h//2, w//2
+                r = window//2
+                arr = arr[cy-r:cy-r+window, cx-r:cx-r+window]
+            lo, hi = np.percentile(arr, (2, 98))
+            vmins[j] = min(vmins[j], lo)
+            vmaxs[j] = max(vmaxs[j], hi)
+            data[i][j] = arr
+
+    fig, axes = plt.subplots(2, 5, figsize=(10, 4), constrained_layout=True)
+    for i, (g, _) in enumerate(groups):
+        for j in range(5):
+            ax = axes[i, j]
+            im = ax.imshow(data[i][j], cmap='jet',
+                           vmin=vmins[j], vmax=vmaxs[j])
+            if i == 0:
+                ax.set_title(QPI_FORMULAS[j], fontsize=8)
+            if j == 0:
+                ax.set_ylabel(g.capitalize(), fontsize=10)
+            ax.axis('off')
+            sb = params['scalebar_um'] / params['pixel_size']
+            h3, w3 = data[i][j].shape
+            x0, y0 = int(0.02*w3), int(0.95*h3)
+            ax.plot([x0, x0+sb], [y0, y0], 'w-', lw=1.5)
+            ax.text(x0, y0-0.05*h3,
+                    f"{params['scalebar_um']} µm",
+                    fontsize=6, color='white')
+            cb = fig.colorbar(im, ax=ax, fraction=0.04, pad=0.01)
+            cb.set_label(CB_LABELS[j], fontsize=7)
+            cb.ax.tick_params(labelsize=6)
+
+    for w in (None, 3, 25, 50):
+        tag = 'full' if w is None else f'win{w}'
+        fig.savefig(os.path.join(out_dir, f"combined_qpi_{tag}.png"), dpi=200)
+    plt.close(fig)
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--background_phase', type=float, default=-0.2,
+                        help="Background phase offset (rad)")
+    parser.add_argument('--var_window',       type=int,   default=20,
+                        help="Window size for local variance")
+    parser.add_argument('--disorder_window',  type=int,   default=20,
+                        help="Window size for disorder computation")
+    parser.add_argument('--n_mean',           type=float, default=2.0,
+                        help="Mean refractive index for disorder")
+    parser.add_argument('--l_c',              type=float, default=1.0,
+                        help="Correlation length for disorder")
+    parser.add_argument('--scalebar_um',      type=float, default=30.0,
+                        help="Scalebar length in µm")
+    parser.add_argument('--benign_dir',       default=RAW_BENIGN_DIR,
+                        help="Directory of raw benign TIFFs")
+    parser.add_argument('--cancer_dir',       default=RAW_CANCER_DIR,
+                        help="Directory of raw cancer TIFFs")
+    parser.add_argument('--output_dir',       default=OUTPUT_DIR,
+                        help="Directory to save QPI maps and figures")
+    parser.add_argument('--pixel_area',    type=float, default=0.11627,
+                        help="Pixel area (µm²) for scattering MFP")
+    parser.add_argument('--sample_height', type=float, default=7.0,
+                        help="Sample height (µm) for scattering MFP")
+    parser.add_argument('--eps',           type=float, default=1e-8,
+                        help="Small epsilon to avoid divide by zero")
+    parser.add_argument('--pixel_size',    type=float, default=np.sqrt(0.116527),
+                        help="Pixel size (µm) for gradient computation")
+    parser.add_argument('--pixel_size_nm', type=float, default=np.sqrt(0.116527)*1000,
+                        help="Pixel size (nm) for gradient computation")
+    parser.add_argument('--k0',            type=float, default=2*np.pi/555.0,
+                        help="Wave number (rad/µm) for anisotropy map")
+
+    # Use parse_known_args() to ignore Jupyter's -f flag
+    args, _ = parser.parse_known_args()
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    params = vars(args)
+
+    # Gather raw sample lists
+    raw_b = list_raw_samples(params['benign_dir'])
+    raw_c = list_raw_samples(params['cancer_dir'])
+    raw_benign = [os.path.splitext(os.path.basename(f))[0] for f in raw_b]
+    raw_cancer = [os.path.splitext(os.path.basename(f))[0] for f in raw_c]
+    params['raw_benign'] = raw_benign
+    params['raw_cancer'] = raw_cancer
+
+    print(f"✅ Using {len(raw_benign)} benign and {len(raw_cancer)} cancer files for QPI processing.")
+
+    # Compute QPI maps
+    for fpath in raw_b:
+        process_file(fpath, params['output_dir'], params, 'benign')
+    for fpath in raw_c:
+        process_file(fpath, params['output_dir'], params, 'cancer')
+
+    # Generate figures
+    if raw_benign:
+        plot_individual_qpi(raw_benign[0], 'benign', params, params['output_dir'])
+    if raw_cancer:
+        plot_individual_qpi(raw_cancer[0], 'cancer', params, params['output_dir'])
+    plot_four_sample_qpi(params, params['output_dir'])
+    for grp, fld in [('benign', CH_BENIGN_DIR), ('cancer', CH_CANCER_DIR)]:
+        plot_channel_montage(grp, fld, params, params['output_dir'], window=None)
+        for w in (3, 25, 50):
+            plot_channel_montage(grp, fld, params, params['output_dir'], window=w)
+    plot_combined_qpi(params, params['output_dir'], window=None)
+
+if __name__ == '__main__':
+    main()
